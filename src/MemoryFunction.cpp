@@ -51,6 +51,20 @@
 #elif defined(MEMFUNC_USE_MMAP)
 #include <sys/mman.h>
 #include <pthread.h>
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// pthread_jit_write_protect_np() exists and works on iOS at runtime (it's how
+// MAP_JIT regions toggle W^X), but the iOS SDK marks it __API_UNAVAILABLE(ios),
+// so a direct call won't compile. Resolve it via dlsym to bypass the
+// compile-time availability gate, and route the calls below to this wrapper.
+#include <dlfcn.h>
+static inline void memfunc_ios_jit_write_protect(int enabled)
+{
+	typedef void (*jit_wp_fn_t)(int);
+	static jit_wp_fn_t fn = reinterpret_cast<jit_wp_fn_t>(dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np"));
+	if(fn) fn(enabled);
+}
+#define pthread_jit_write_protect_np(enabled) memfunc_ios_jit_write_protect(enabled)
+#endif
 #elif defined(MEMFUNC_USE_WASM)
 EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction");
 EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
