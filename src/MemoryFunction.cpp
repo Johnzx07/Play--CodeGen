@@ -22,6 +22,14 @@
 		#if TARGET_CPU_ARM64
 			#define MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 		#endif
+	#elif TARGET_OS_IPHONE && TARGET_CPU_ARM64
+		// iOS 26 removed the legacy vm_protect RWX-toggle JIT path (the old
+		// MACHVM strict-protection method). Use the same MAP_JIT + per-thread
+		// W^X write-protect method macOS arm64 already uses, which iOS now
+		// requires for JIT-enabled apps (e.g. via StikDebug).
+		#define MEMFUNC_USE_MMAP
+		#define MEMFUNC_MMAP_ADDITIONAL_FLAGS (MAP_JIT)
+		#define MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 	#else
 		#define MEMFUNC_USE_MACHVM
 		#if TARGET_OS_IPHONE
