@@ -23,15 +23,14 @@
 			#define MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 		#endif
 	#elif TARGET_OS_IPHONE && TARGET_CPU_ARM64
-		// iOS 26 blocks changing an existing page's protection to add execute
-		// (the old MACHVM vm_protect RW->RX path this code used on iOS), which is
-		// what stopped games launching with JIT. MAP_JIT is not an option either:
-		// it needs the dynamic-codesigning entitlement, which sideloaded /
-		// LiveContainer apps don't have. Under debugger-based JIT (get-task-allow
-		// + StikDebug or LiveContainer) an RWX page mapped up-front works, so map
-		// it read/write/execute once and never change its protection.
+		// iOS 26 stopped games launching with JIT: the old MACHVM path relied on
+		// vm_protect to flip a page to executable, which iOS 26 no longer allows,
+		// and A15+ chips enforce W^X (no RWX pages). Use the same MAP_JIT +
+		// per-thread write-protect method that works for other emulators on these
+		// chips (e.g. DolphiniOS) under debugger-based JIT (StikDebug / LiveContainer).
 		#define MEMFUNC_USE_MMAP
-		#define MEMFUNC_MMAP_RWX
+		#define MEMFUNC_MMAP_ADDITIONAL_FLAGS (MAP_JIT)
+		#define MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 	#else
 		#define MEMFUNC_USE_MACHVM
 		#if TARGET_OS_IPHONE
@@ -53,6 +52,19 @@
 #elif defined(MEMFUNC_USE_MMAP)
 #include <sys/mman.h>
 #include <pthread.h>
+#if defined(__APPLE__) && TARGET_OS_IPHONE && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
+// pthread_jit_write_protect_np() works on iOS at runtime (JIT W^X toggling) but
+// the iOS SDK marks it __API_UNAVAILABLE(ios), so a direct call won't compile.
+// Resolve it via dlsym and route the calls below through this wrapper.
+#include <dlfcn.h>
+static inline void memfunc_ios_jit_write_protect(int enabled)
+{
+	typedef void (*jit_wp_fn_t)(int);
+	static jit_wp_fn_t fn = reinterpret_cast<jit_wp_fn_t>(dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np"));
+	if(fn) fn(enabled);
+}
+#define pthread_jit_write_protect_np(enabled) memfunc_ios_jit_write_protect(enabled)
+#endif
 #elif defined(MEMFUNC_USE_WASM)
 EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction");
 EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
@@ -128,13 +140,8 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 	#ifdef MEMFUNC_MMAP_ADDITIONAL_FLAGS
 		additionalMapFlags = MEMFUNC_MMAP_ADDITIONAL_FLAGS;
 	#endif
-	#ifdef MEMFUNC_MMAP_RWX
-		int mmapProtection = PROT_READ | PROT_WRITE | PROT_EXEC;
-	#else
-		int mmapProtection = PROT_WRITE | PROT_EXEC;
-	#endif
 	m_size = size;
-	m_code = mmap(nullptr, size, mmapProtection, MAP_PRIVATE | MAP_ANONYMOUS | additionalMapFlags, -1, 0);
+	m_code = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | additionalMapFlags, -1, 0);
 	assert(m_code != MAP_FAILED);
 #ifdef MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 	pthread_jit_write_protect_np(false);
