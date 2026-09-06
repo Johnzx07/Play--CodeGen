@@ -23,14 +23,14 @@
 			#define MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 		#endif
 	#elif TARGET_OS_IPHONE && TARGET_CPU_ARM64
-		// iOS 26 / A15+: mprotect can't add execute (hardware W^X) and the old
-		// MACHVM path can't either. The only method that yields runnable JIT is
-		// MAP_JIT + pthread_jit_write_protect_np - which the kernel authorizes
-		// when the process is granted JIT by an attached debugger (StikDebug
-		// running against the app natively). Same method DolphiniOS uses.
+		// iOS 26 on TXM/SPTM hardware (A15+): the process itself can never make a
+		// page executable - MAP_JIT returns EPERM without dynamic-codesigning, and
+		// mprotect silently strips PROT_EXEC. Only a write performed *through an
+		// attached debug connection* marks a page as JIT-executable. StikDebug's
+		// universal.js implements that debugger side; the app has to ask for it by
+		// trapping with brk #0xf00d (x16 = command). See StikJIT INTEGRATION.md.
 		#define MEMFUNC_USE_MMAP
-		#define MEMFUNC_MMAP_ADDITIONAL_FLAGS (MAP_JIT)
-		#define MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
+		#define MEMFUNC_IOS26_JIT_PROTOCOL
 	#else
 		#define MEMFUNC_USE_MACHVM
 		#if TARGET_OS_IPHONE
@@ -52,17 +52,32 @@
 #elif defined(MEMFUNC_USE_MMAP)
 #include <sys/mman.h>
 #include <pthread.h>
-#if defined(__APPLE__) && TARGET_OS_IPHONE && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
-// pthread_jit_write_protect_np() works on iOS at runtime but the SDK marks it
-// __API_UNAVAILABLE(ios); resolve via dlsym and route the calls through it.
-#include <dlfcn.h>
-static inline void memfunc_ios_jit_write_protect(int enabled)
+#if defined(MEMFUNC_IOS26_JIT_PROTOCOL)
+#include <unistd.h>
+
+// --- iOS 26 TXM JIT protocol (StikDebug / StikJIT "universal" script) ---------
+// The attached debugger blesses a region by writing one byte into each 16K page
+// over the debug connection; that is what makes the pages executable on TXM
+// hardware. The app requests it by trapping with brk #0xf00d, passing the
+// command in x16 and the region in x0/x1. A brk with no debugger attached kills
+// the process, so every call is gated on CS_DEBUGGED.
+extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, size_t usersize);
+
+static bool MemFunc_IsDebuggerAttached()
 {
-	typedef void (*jit_wp_fn_t)(int);
-	static jit_wp_fn_t fn = reinterpret_cast<jit_wp_fn_t>(dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np"));
-	if(fn) fn(enabled);
+	uint32_t flags = 0;
+	if(csops(getpid(), 0 /*CS_OPS_STATUS*/, &flags, sizeof(flags)) != 0) return false;
+	return (flags & 0x10000000u) != 0; //CS_DEBUGGED
 }
-#define pthread_jit_write_protect_np(enabled) memfunc_ios_jit_write_protect(enabled)
+
+__attribute__((noinline, optnone, naked))
+static void* JIT26PrepareRegion(void* address, size_t length)
+{
+	__asm__ volatile(
+	    "mov x16, #1\n"
+	    "brk #0xf00d\n"
+	    "ret\n");
+}
 #endif
 #elif defined(MEMFUNC_USE_WASM)
 EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction");
@@ -142,6 +157,14 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 	m_size = size;
 	m_code = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | additionalMapFlags, -1, 0);
 	assert(m_code != MAP_FAILED);
+#ifdef MEMFUNC_IOS26_JIT_PROTOCOL
+	// Have the debugger bless these pages so they can be executed. It writes a
+	// byte into every 16K page, so this must happen BEFORE we copy the code in.
+	if(MemFunc_IsDebuggerAttached())
+	{
+		JIT26PrepareRegion(m_code, m_size);
+	}
+#endif
 #ifdef MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 	pthread_jit_write_protect_np(false);
 #endif
