@@ -23,16 +23,14 @@
 			#define MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 		#endif
 	#elif TARGET_OS_IPHONE && TARGET_CPU_ARM64
-		// On-device probe (iOS 26.4.2, A17 Pro, via StikDebug/LiveContainer):
-		//   * mmap with MAP_JIT  -> EPERM (needs dynamic-codesigning entitlement)
-		//   * mmap PROT_READ|WRITE|EXEC -> page has current rw-, MAX protection rwx
-		//   * mmap PROT_READ|WRITE then mprotect +EXEC -> stays non-exec (max rw-)
-		// So the JIT buffer must be mmap'd WITH PROT_EXEC so its max protection is
-		// rwx, then flipped between rw- (to write) and r-x (to execute) via
-		// mprotect. The old MACHVM path failed because it allocated without exec
-		// in the max protection, so it could never be made executable on iOS 26.
+		// iOS 26 / A15+: mprotect can't add execute (hardware W^X) and the old
+		// MACHVM path can't either. The only method that yields runnable JIT is
+		// MAP_JIT + pthread_jit_write_protect_np - which the kernel authorizes
+		// when the process is granted JIT by an attached debugger (StikDebug
+		// running against the app natively). Same method DolphiniOS uses.
 		#define MEMFUNC_USE_MMAP
-		#define MEMFUNC_MMAP_MPROTECT_JIT
+		#define MEMFUNC_MMAP_ADDITIONAL_FLAGS (MAP_JIT)
+		#define MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 	#else
 		#define MEMFUNC_USE_MACHVM
 		#if TARGET_OS_IPHONE
@@ -54,6 +52,18 @@
 #elif defined(MEMFUNC_USE_MMAP)
 #include <sys/mman.h>
 #include <pthread.h>
+#if defined(__APPLE__) && TARGET_OS_IPHONE && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
+// pthread_jit_write_protect_np() works on iOS at runtime but the SDK marks it
+// __API_UNAVAILABLE(ios); resolve via dlsym and route the calls through it.
+#include <dlfcn.h>
+static inline void memfunc_ios_jit_write_protect(int enabled)
+{
+	typedef void (*jit_wp_fn_t)(int);
+	static jit_wp_fn_t fn = reinterpret_cast<jit_wp_fn_t>(dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np"));
+	if(fn) fn(enabled);
+}
+#define pthread_jit_write_protect_np(enabled) memfunc_ios_jit_write_protect(enabled)
+#endif
 #elif defined(MEMFUNC_USE_WASM)
 EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction");
 EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
@@ -138,10 +148,6 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 	memcpy(m_code, code, size);
 #ifdef MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 	pthread_jit_write_protect_np(true);
-#endif
-#ifdef MEMFUNC_MMAP_MPROTECT_JIT
-	// Flip the freshly-written page from rw- to r-x so it can execute.
-	mprotect(m_code, m_size, PROT_READ | PROT_EXEC);
 #endif
 #elif defined(MEMFUNC_USE_WASM)
 	m_wasmModule = emscripten::val::take_ownership(WasmCreateModule(reinterpret_cast<uintptr_t>(code), size));
@@ -231,8 +237,6 @@ void CMemoryFunction::BeginModify()
 	assert(result == 0);
 #elif defined(MEMFUNC_USE_MMAP) && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
 	pthread_jit_write_protect_np(false);
-#elif defined(MEMFUNC_USE_MMAP) && defined(MEMFUNC_MMAP_MPROTECT_JIT)
-	mprotect(m_code, m_size, PROT_READ | PROT_WRITE);
 #endif
 }
 
@@ -243,8 +247,6 @@ void CMemoryFunction::EndModify()
 	assert(result == 0);
 #elif defined(MEMFUNC_USE_MMAP) && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
 	pthread_jit_write_protect_np(true);
-#elif defined(MEMFUNC_USE_MMAP) && defined(MEMFUNC_MMAP_MPROTECT_JIT)
-	mprotect(m_code, m_size, PROT_READ | PROT_EXEC);
 #endif
 	ClearCache();
 }
