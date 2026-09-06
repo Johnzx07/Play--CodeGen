@@ -78,6 +78,112 @@ static void* JIT26PrepareRegion(void* address, size_t length)
 	    "brk #0xf00d\n"
 	    "ret\n");
 }
+
+// A region can only be blessed while the JIT script is still attached, and the
+// script's window closes early in the launch sequence ("a region introduced
+// later cannot be prepared by a script that has already detached"). Play!
+// creates a new executable region for every basic block, so instead of blessing
+// per block we reserve one large arena up front, bless it once, and sub-allocate
+// every block out of it.
+#include <mutex>
+#include <vector>
+#include <cstdio>
+#include <errno.h>
+
+static const size_t MEMFUNC_JIT_ARENA_SIZE = 96 * 1024 * 1024;
+
+namespace
+{
+	struct MEMFUNC_FREE_CHUNK
+	{
+		uint8* ptr;
+		size_t size;
+	};
+}
+
+static uint8* g_jitArenaBase = nullptr;
+static size_t g_jitArenaBump = 0;
+static bool g_jitArenaBlessed = false;
+static std::mutex g_jitArenaMutex;
+static std::vector<MEMFUNC_FREE_CHUNK> g_jitArenaFree;
+static char g_jitStatus[224] = "jit: arena not initialized";
+
+static void MemFunc_ArenaInitLocked()
+{
+	if(g_jitArenaBase != nullptr) return;
+	void* mem = mmap(nullptr, MEMFUNC_JIT_ARENA_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
+	                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if(mem == MAP_FAILED)
+	{
+		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: arena mmap FAILED errno=%d", errno);
+		return;
+	}
+	g_jitArenaBase = static_cast<uint8*>(mem);
+	bool debugged = MemFunc_IsDebuggerAttached();
+	if(debugged)
+	{
+		JIT26PrepareRegion(g_jitArenaBase, MEMFUNC_JIT_ARENA_SIZE);
+		g_jitArenaBlessed = true;
+	}
+	snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: arena %zuMB @%p dbg=%d blessed=%d",
+	         static_cast<size_t>(MEMFUNC_JIT_ARENA_SIZE >> 20), static_cast<void*>(g_jitArenaBase),
+	         debugged ? 1 : 0, g_jitArenaBlessed ? 1 : 0);
+}
+
+static void* MemFunc_ArenaAlloc(size_t size)
+{
+	std::lock_guard<std::mutex> lock(g_jitArenaMutex);
+	MemFunc_ArenaInitLocked();
+	if(!g_jitArenaBlessed) return nullptr;
+	size_t aligned = (size + (BLOCK_ALIGN - 1)) & ~static_cast<size_t>(BLOCK_ALIGN - 1);
+	for(size_t i = 0; i < g_jitArenaFree.size(); i++)
+	{
+		if(g_jitArenaFree[i].size >= aligned)
+		{
+			uint8* result = g_jitArenaFree[i].ptr;
+			if(g_jitArenaFree[i].size >= aligned + BLOCK_ALIGN)
+			{
+				g_jitArenaFree[i].ptr += aligned;
+				g_jitArenaFree[i].size -= aligned;
+			}
+			else
+			{
+				g_jitArenaFree.erase(g_jitArenaFree.begin() + i);
+			}
+			return result;
+		}
+	}
+	if((g_jitArenaBump + aligned) > MEMFUNC_JIT_ARENA_SIZE) return nullptr;
+	uint8* result = g_jitArenaBase + g_jitArenaBump;
+	g_jitArenaBump += aligned;
+	return result;
+}
+
+static bool MemFunc_ArenaOwns(void* ptr)
+{
+	return (g_jitArenaBase != nullptr) && (ptr >= g_jitArenaBase) &&
+	       (ptr < (g_jitArenaBase + MEMFUNC_JIT_ARENA_SIZE));
+}
+
+static void MemFunc_ArenaFree(void* ptr, size_t size)
+{
+	std::lock_guard<std::mutex> lock(g_jitArenaMutex);
+	size_t aligned = (size + (BLOCK_ALIGN - 1)) & ~static_cast<size_t>(BLOCK_ALIGN - 1);
+	g_jitArenaFree.push_back({static_cast<uint8*>(ptr), aligned});
+}
+
+// Called by the app as early as possible (while the JIT script is still
+// attached) so the arena gets blessed before any game code is compiled.
+extern "C" void MemFunc_InitJitArena()
+{
+	std::lock_guard<std::mutex> lock(g_jitArenaMutex);
+	MemFunc_ArenaInitLocked();
+}
+
+extern "C" const char* MemFunc_GetJitStatus()
+{
+	return g_jitStatus;
+}
 #endif
 #elif defined(MEMFUNC_USE_WASM)
 EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction");
@@ -155,15 +261,23 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 		additionalMapFlags = MEMFUNC_MMAP_ADDITIONAL_FLAGS;
 	#endif
 	m_size = size;
+#ifdef MEMFUNC_IOS26_JIT_PROTOCOL
+	// Blocks come out of the pre-blessed arena. Only if that is unavailable do we
+	// fall back to a private mapping (which can only run if the script happens to
+	// still be attached).
+	m_code = MemFunc_ArenaAlloc(size);
+	if(m_code == nullptr)
+	{
+		m_code = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		assert(m_code != MAP_FAILED);
+		if(MemFunc_IsDebuggerAttached())
+		{
+			JIT26PrepareRegion(m_code, m_size);
+		}
+	}
+#else
 	m_code = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | additionalMapFlags, -1, 0);
 	assert(m_code != MAP_FAILED);
-#ifdef MEMFUNC_IOS26_JIT_PROTOCOL
-	// Have the debugger bless these pages so they can be executed. It writes a
-	// byte into every 16K page, so this must happen BEFORE we copy the code in.
-	if(MemFunc_IsDebuggerAttached())
-	{
-		JIT26PrepareRegion(m_code, m_size);
-	}
 #endif
 #ifdef MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 	pthread_jit_write_protect_np(false);
@@ -208,7 +322,19 @@ void CMemoryFunction::Reset()
 #elif defined(MEMFUNC_USE_MACHVM)
 		vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size);
 #elif defined(MEMFUNC_USE_MMAP)
+	#ifdef MEMFUNC_IOS26_JIT_PROTOCOL
+		// Arena memory must never be unmapped - it can't be blessed again.
+		if(MemFunc_ArenaOwns(m_code))
+		{
+			MemFunc_ArenaFree(m_code, m_size);
+		}
+		else
+		{
+			munmap(m_code, m_size);
+		}
+	#else
 		munmap(m_code, m_size);
+	#endif
 #elif defined(MEMFUNC_USE_WASM)
 		WasmDeleteFunction(reinterpret_cast<int>(m_code));
 #endif
