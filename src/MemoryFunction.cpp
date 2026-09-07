@@ -54,13 +54,31 @@
 #include <pthread.h>
 #if defined(MEMFUNC_IOS26_JIT_PROTOCOL)
 #include <unistd.h>
+#include <mutex>
+#include <vector>
+#include <cstdio>
+#include <errno.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
 
 // --- iOS 26 TXM JIT protocol (StikDebug / StikJIT "universal" script) ---------
-// The attached debugger blesses a region by writing one byte into each 16K page
-// over the debug connection; that is what makes the pages executable on TXM
-// hardware. The app requests it by trapping with brk #0xf00d, passing the
-// command in x16 and the region in x0/x1. A brk with no debugger attached kills
-// the process, so every call is gated on CS_DEBUGGED.
+// On TXM/SPTM hardware (A15+) a process can never grant itself PROT_EXEC. The
+// only mechanism is an out-of-process write performed by an attached debugger:
+// for each 16K page of a region, debugserver writes one byte, and that write is
+// what grants the page execute permission. StikDebug's universal.js implements
+// that side; the app requests it with brk #0xf00d (command in x16, args x0/x1).
+//
+// Two details are load-bearing and easy to get wrong:
+//  * The region address passed in x0 MUST be null. That selects the debugger's
+//    "fresh allocation" branch (it allocates via GDB-remote _M<len>,rx and then
+//    prepares it). Passing an address we allocated ourselves returns success but
+//    silently never grants execute permission.
+//  * The region handed back is execute-only - writing to it faults. A second,
+//    writable alias of the same physical pages is made locally with vm_remap.
+//
+// A brk with no debugger attached raises an unhandled SIGTRAP that kills the
+// process, so every call is gated on CS_DEBUGGED. We never send JIT26Detach:
+// execute permission is tied to the debugger staying attached.
 extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, size_t usersize);
 
 static bool MemFunc_IsDebuggerAttached()
@@ -79,101 +97,129 @@ static void* JIT26PrepareRegion(void* address, size_t length)
 	    "ret\n");
 }
 
-// A region can only be blessed while the JIT script is still attached, and the
-// script's window closes early in the launch sequence ("a region introduced
-// later cannot be prepared by a script that has already detached"). Play!
-// creates a new executable region for every basic block, so instead of blessing
-// per block we reserve one large arena up front, bless it once, and sub-allocate
-// every block out of it.
-#include <mutex>
-#include <vector>
-#include <cstdio>
-#include <errno.h>
-
-static const size_t MEMFUNC_JIT_ARENA_SIZE = 96 * 1024 * 1024;
+// One dual-mapped arena for the whole session: the executable side is obtained
+// once from the debugger, the writable side is a local alias of it, and every
+// block is sub-allocated out of the pair.
+static const size_t MEMFUNC_JIT_ARENA_SIZE = 64 * 1024 * 1024;
 
 namespace
 {
 	struct MEMFUNC_FREE_CHUNK
 	{
-		uint8* ptr;
+		size_t offset;
 		size_t size;
 	};
 }
 
-static uint8* g_jitArenaBase = nullptr;
+static uint8* g_jitArenaRx = nullptr;
+static uint8* g_jitArenaRw = nullptr;
 static size_t g_jitArenaBump = 0;
-static bool g_jitArenaBlessed = false;
+static bool g_jitArenaReady = false;
+static bool g_jitArenaTried = false;
 static std::mutex g_jitArenaMutex;
 static std::vector<MEMFUNC_FREE_CHUNK> g_jitArenaFree;
-static char g_jitStatus[224] = "jit: arena not initialized";
+static char g_jitStatus[256] = "jit: not initialized";
 
 static void MemFunc_ArenaInitLocked()
 {
-	if(g_jitArenaBase != nullptr) return;
-	void* mem = mmap(nullptr, MEMFUNC_JIT_ARENA_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
-	                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if(mem == MAP_FAILED)
+	if(g_jitArenaTried) return;
+	g_jitArenaTried = true;
+
+	if(!MemFunc_IsDebuggerAttached())
 	{
-		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: arena mmap FAILED errno=%d", errno);
+		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: FAIL no debugger (CS_DEBUGGED=0)");
 		return;
 	}
-	g_jitArenaBase = static_cast<uint8*>(mem);
-	bool debugged = MemFunc_IsDebuggerAttached();
-	if(debugged)
+
+	//x0 must be null: this is the debugger's fresh-allocation branch.
+	void* rx = JIT26PrepareRegion(nullptr, MEMFUNC_JIT_ARENA_SIZE);
+	if(rx == nullptr)
 	{
-		JIT26PrepareRegion(g_jitArenaBase, MEMFUNC_JIT_ARENA_SIZE);
-		g_jitArenaBlessed = true;
+		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: FAIL PrepareRegion(null,%zuMB)=NULL",
+		         static_cast<size_t>(MEMFUNC_JIT_ARENA_SIZE >> 20));
+		return;
 	}
-	snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: arena %zuMB @%p dbg=%d blessed=%d",
-	         static_cast<size_t>(MEMFUNC_JIT_ARENA_SIZE >> 20), static_cast<void*>(g_jitArenaBase),
-	         debugged ? 1 : 0, g_jitArenaBlessed ? 1 : 0);
+
+	//The returned region is execute-only; alias it for writing.
+	vm_address_t rw = 0;
+	vm_prot_t curProt = VM_PROT_NONE;
+	vm_prot_t maxProt = VM_PROT_NONE;
+	kern_return_t kr = vm_remap(mach_task_self(), &rw, static_cast<vm_size_t>(MEMFUNC_JIT_ARENA_SIZE),
+	                            0, VM_FLAGS_ANYWHERE, mach_task_self(),
+	                            reinterpret_cast<vm_address_t>(rx), FALSE,
+	                            &curProt, &maxProt, VM_INHERIT_NONE);
+	if(kr != KERN_SUCCESS)
+	{
+		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: FAIL vm_remap kr=%d rx=%p", static_cast<int>(kr), rx);
+		return;
+	}
+	kr = vm_protect(mach_task_self(), rw, static_cast<vm_size_t>(MEMFUNC_JIT_ARENA_SIZE), FALSE,
+	                VM_PROT_READ | VM_PROT_WRITE);
+	if(kr != KERN_SUCCESS)
+	{
+		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: FAIL vm_protect kr=%d", static_cast<int>(kr));
+		vm_deallocate(mach_task_self(), rw, static_cast<vm_size_t>(MEMFUNC_JIT_ARENA_SIZE));
+		return;
+	}
+
+	g_jitArenaRx = static_cast<uint8*>(rx);
+	g_jitArenaRw = reinterpret_cast<uint8*>(rw);
+	g_jitArenaReady = true;
+	snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: OK %zuMB rx=%p rw=%p",
+	         static_cast<size_t>(MEMFUNC_JIT_ARENA_SIZE >> 20),
+	         static_cast<void*>(g_jitArenaRx), static_cast<void*>(g_jitArenaRw));
 }
 
+//Returns the EXECUTABLE address of a fresh block, or null when unavailable.
 static void* MemFunc_ArenaAlloc(size_t size)
 {
 	std::lock_guard<std::mutex> lock(g_jitArenaMutex);
 	MemFunc_ArenaInitLocked();
-	if(!g_jitArenaBlessed) return nullptr;
+	if(!g_jitArenaReady) return nullptr;
 	size_t aligned = (size + (BLOCK_ALIGN - 1)) & ~static_cast<size_t>(BLOCK_ALIGN - 1);
 	for(size_t i = 0; i < g_jitArenaFree.size(); i++)
 	{
 		if(g_jitArenaFree[i].size >= aligned)
 		{
-			uint8* result = g_jitArenaFree[i].ptr;
+			size_t offset = g_jitArenaFree[i].offset;
 			if(g_jitArenaFree[i].size >= aligned + BLOCK_ALIGN)
 			{
-				g_jitArenaFree[i].ptr += aligned;
+				g_jitArenaFree[i].offset += aligned;
 				g_jitArenaFree[i].size -= aligned;
 			}
 			else
 			{
 				g_jitArenaFree.erase(g_jitArenaFree.begin() + i);
 			}
-			return result;
+			return g_jitArenaRx + offset;
 		}
 	}
 	if((g_jitArenaBump + aligned) > MEMFUNC_JIT_ARENA_SIZE) return nullptr;
-	uint8* result = g_jitArenaBase + g_jitArenaBump;
+	size_t offset = g_jitArenaBump;
 	g_jitArenaBump += aligned;
-	return result;
+	return g_jitArenaRx + offset;
 }
 
 static bool MemFunc_ArenaOwns(void* ptr)
 {
-	return (g_jitArenaBase != nullptr) && (ptr >= g_jitArenaBase) &&
-	       (ptr < (g_jitArenaBase + MEMFUNC_JIT_ARENA_SIZE));
+	return g_jitArenaReady && (ptr >= g_jitArenaRx) && (ptr < (g_jitArenaRx + MEMFUNC_JIT_ARENA_SIZE));
+}
+
+//Maps an executable arena address to its writable alias.
+static void* MemFunc_ArenaToWritable(void* ptr)
+{
+	if(!MemFunc_ArenaOwns(ptr)) return ptr;
+	return g_jitArenaRw + (static_cast<uint8*>(ptr) - g_jitArenaRx);
 }
 
 static void MemFunc_ArenaFree(void* ptr, size_t size)
 {
 	std::lock_guard<std::mutex> lock(g_jitArenaMutex);
 	size_t aligned = (size + (BLOCK_ALIGN - 1)) & ~static_cast<size_t>(BLOCK_ALIGN - 1);
-	g_jitArenaFree.push_back({static_cast<uint8*>(ptr), aligned});
+	g_jitArenaFree.push_back({static_cast<size_t>(static_cast<uint8*>(ptr) - g_jitArenaRx), aligned});
 }
 
-// Called by the app as early as possible (while the JIT script is still
-// attached) so the arena gets blessed before any game code is compiled.
+//Called by the app during launch, while the JIT script is still attached.
 extern "C" void MemFunc_InitJitArena()
 {
 	std::lock_guard<std::mutex> lock(g_jitArenaMutex);
@@ -262,18 +308,15 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 	#endif
 	m_size = size;
 #ifdef MEMFUNC_IOS26_JIT_PROTOCOL
-	// Blocks come out of the pre-blessed arena. Only if that is unavailable do we
-	// fall back to a private mapping (which can only run if the script happens to
-	// still be attached).
+	// m_code is the EXECUTABLE address (sub-allocated from the debugger-prepared
+	// arena); the code itself is written through its writable alias. If the arena
+	// is unavailable we fall back to a plain mapping so the app still runs (it
+	// just won't be able to execute, which the caller reports via the status).
 	m_code = MemFunc_ArenaAlloc(size);
 	if(m_code == nullptr)
 	{
 		m_code = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		assert(m_code != MAP_FAILED);
-		if(MemFunc_IsDebuggerAttached())
-		{
-			JIT26PrepareRegion(m_code, m_size);
-		}
 	}
 #else
 	m_code = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | additionalMapFlags, -1, 0);
@@ -282,7 +325,11 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 #ifdef MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 	pthread_jit_write_protect_np(false);
 #endif
+#ifdef MEMFUNC_IOS26_JIT_PROTOCOL
+	memcpy(MemFunc_ArenaToWritable(m_code), code, size);
+#else
 	memcpy(m_code, code, size);
+#endif
 #ifdef MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 	pthread_jit_write_protect_np(true);
 #endif
@@ -372,6 +419,18 @@ void CMemoryFunction::operator()(void* context)
 void* CMemoryFunction::GetCode() const
 {
 	return m_code;
+}
+
+//Address to write generated code through. Same as GetCode() everywhere except
+//iOS 26, where the executable mapping is not writable and a separate alias of
+//the same physical pages must be used.
+void* CMemoryFunction::GetWritableCode() const
+{
+#ifdef MEMFUNC_IOS26_JIT_PROTOCOL
+	return MemFunc_ArenaToWritable(m_code);
+#else
+	return m_code;
+#endif
 }
 
 size_t CMemoryFunction::GetSize() const
