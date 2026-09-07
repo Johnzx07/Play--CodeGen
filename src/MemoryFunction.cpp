@@ -230,6 +230,15 @@ extern "C" const char* MemFunc_GetJitStatus()
 {
 	return g_jitStatus;
 }
+
+//True once an executable JIT region has actually been obtained. This is the
+//authoritative "is JIT usable" signal on iOS 26 - process-level flags like a
+//debugger being attached do not imply an executable region was granted.
+extern "C" bool MemFunc_IsJitReady()
+{
+	std::lock_guard<std::mutex> lock(g_jitArenaMutex);
+	return g_jitArenaReady;
+}
 #endif
 #elif defined(MEMFUNC_USE_WASM)
 EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction");
@@ -471,3 +480,10 @@ CMemoryFunction CMemoryFunction::CreateInstance()
 	return CMemoryFunction(GetCode(), GetSize());
 #endif
 }
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !defined(MEMFUNC_IOS26_JIT_PROTOCOL)
+//iOS targets that don't use the TXM JIT protocol still link against these.
+extern "C" void MemFunc_InitJitArena() {}
+extern "C" const char* MemFunc_GetJitStatus() { return "jit: not applicable"; }
+extern "C" bool MemFunc_IsJitReady() { return false; }
+#endif
