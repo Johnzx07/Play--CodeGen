@@ -120,22 +120,69 @@ static std::mutex g_jitArenaMutex;
 static std::vector<MEMFUNC_FREE_CHUNK> g_jitArenaFree;
 static char g_jitStatus[256] = "jit: not initialized";
 
+//An unserviced request doesn't necessarily return null: the breakpoint encoding
+//can be left behind in x0, so the result has to be validated before it's used as
+//an address.
+static bool MemFunc_IsUsableJitRegion(void* ptr)
+{
+	uintptr_t value = reinterpret_cast<uintptr_t>(ptr);
+	if(value == 0) return false;
+	if(value == static_cast<uintptr_t>(-1)) return false;
+	//Leftovers from an unserviced breakpoint (0x69 is the legacy brk immediate).
+	if(value == 0x690000e0ull) return false;
+	if(value == 0xcccccccc690000e0ull) return false;
+	//Anything the debugger hands back is page aligned.
+	if((value & 0x3FFFull) != 0) return false;
+	return true;
+}
+
 static void MemFunc_ArenaInitLocked()
 {
 	if(g_jitArenaTried) return;
 	g_jitArenaTried = true;
 
-	if(!MemFunc_IsDebuggerAttached())
+	void* rx = nullptr;
+	const char* source = "none";
+
+	//Preferred path: ask the attached debugger for an executable region. This is
+	//the only thing that can work where TXM is enforced, and it works fine where
+	//it isn't, so we never branch on a TXM check of our own. Such a check goes
+	//stale as soon as Apple enables TXM on more devices in a point release, which
+	//sends the app down a path that can no longer produce executable memory.
+	if(MemFunc_IsDebuggerAttached())
 	{
-		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: FAIL no debugger (CS_DEBUGGED=0)");
-		return;
+		//The script can be momentarily busy or suspended, so don't give up on the
+		//first miss.
+		for(unsigned int attempt = 0; attempt < 3; attempt++)
+		{
+			void* candidate = JIT26PrepareRegion(nullptr, MEMFUNC_JIT_ARENA_SIZE);
+			if(MemFunc_IsUsableJitRegion(candidate))
+			{
+				rx = candidate;
+				source = "debugger";
+				break;
+			}
+			usleep(50 * 1000);
+		}
 	}
 
-	//x0 must be null: this is the debugger's fresh-allocation branch.
-	void* rx = JIT26PrepareRegion(nullptr, MEMFUNC_JIT_ARENA_SIZE);
+	//Where nothing is enforcing W^X the process can still map an executable
+	//region itself, so fall back to that rather than failing outright.
 	if(rx == nullptr)
 	{
-		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: FAIL PrepareRegion(null,%zuMB)=NULL",
+		void* mapped = mmap(nullptr, MEMFUNC_JIT_ARENA_SIZE, PROT_READ | PROT_EXEC,
+		                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if(mapped != MAP_FAILED)
+		{
+			rx = mapped;
+			source = "mmap";
+		}
+	}
+
+	if(rx == nullptr)
+	{
+		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: FAIL no region (dbg=%d, %zuMB)",
+		         MemFunc_IsDebuggerAttached() ? 1 : 0,
 		         static_cast<size_t>(MEMFUNC_JIT_ARENA_SIZE >> 20));
 		return;
 	}
@@ -150,7 +197,7 @@ static void MemFunc_ArenaInitLocked()
 	                            &curProt, &maxProt, VM_INHERIT_NONE);
 	if(kr != KERN_SUCCESS)
 	{
-		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: FAIL vm_remap kr=%d rx=%p", static_cast<int>(kr), rx);
+		snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: FAIL vm_remap kr=%d (%s) rx=%p", static_cast<int>(kr), source, rx);
 		return;
 	}
 	kr = vm_protect(mach_task_self(), rw, static_cast<vm_size_t>(MEMFUNC_JIT_ARENA_SIZE), FALSE,
@@ -165,8 +212,8 @@ static void MemFunc_ArenaInitLocked()
 	g_jitArenaRx = static_cast<uint8*>(rx);
 	g_jitArenaRw = reinterpret_cast<uint8*>(rw);
 	g_jitArenaReady = true;
-	snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: OK %zuMB rx=%p rw=%p",
-	         static_cast<size_t>(MEMFUNC_JIT_ARENA_SIZE >> 20),
+	snprintf(g_jitStatus, sizeof(g_jitStatus), "jit: OK via %s %zuMB rx=%p rw=%p",
+	         source, static_cast<size_t>(MEMFUNC_JIT_ARENA_SIZE >> 20),
 	         static_cast<void*>(g_jitArenaRx), static_cast<void*>(g_jitArenaRw));
 }
 
